@@ -1,18 +1,16 @@
-
 from __future__ import annotations
 import argparse
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from joblib import dump, load
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import classification_report, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 # Optional imports
@@ -41,10 +39,10 @@ except Exception:
 # -----------------------------
 @dataclass
 class FeatureConfig:
+    # Updated feature set: log features and port bins (avoid raw large port magnitudes)
     numeric_cols: List[str] = field(default_factory=lambda: [
-        "bytes", "packets", "src_port", "dst_port",
-        "proto_id", "flow_duration_ms", "pps", "bps",
-    ])
+    "bytes_log", "packets_log", "pps_log", "bps_log", "flow_duration_ms"
+])
     categorical_cols: List[str] = field(default_factory=lambda: [
         "protocol", "device_id",
     ])
@@ -60,16 +58,15 @@ class FeatureConfig:
 @dataclass
 class TrainConfig:
     algo: str = "isolation_forest"  # or "autoencoder" (if TF)
-    n_estimators: int = 200
-    contamination: float = 0.01
+    n_estimators: int = 300
+    contamination: float = 0.02
     max_samples: str | int = "auto"
     random_state: int = 42
 
 
 @dataclass
 class ThresholdConfig:
-    # Higher score => more anomalous. We'll map model outputs to [0,1]
-    threshold: float = 0.6
+    threshold: float = 0.6  # Higher => less sensitive
 
 
 # -----------------------------
@@ -89,6 +86,18 @@ def _safe_float(x: Any) -> float:
         return 0.0
 
 
+def _port_bin(x: Any) -> int:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    if v <= 1023:
+        return 0  # well-known
+    if v <= 49151:
+        return 1  # registered
+    return 2      # dynamic/private
+
+
 # -----------------------------
 # Feature Extraction
 # -----------------------------
@@ -98,44 +107,56 @@ class FeatureExtractor:
 
     def transform_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        # Basic cleaning
+
+        # Timestamp
         if self.cfg.time_col in df.columns:
             df[self.cfg.time_col] = _ensure_datetime(df[self.cfg.time_col])
-        # Derive helper numeric columns
-        df["proto_id"] = df.get("protocol", "TCP").map(self.cfg.protocol_map).fillna(0).astype(int)
+
+        # Protocol → proto_id
+        df["protocol"] = df.get("protocol", "TCP").fillna("TCP").astype(str)
+        df["proto_id"] = df["protocol"].map(self.cfg.protocol_map).fillna(0).astype(int)
+
+        # Base numeric
         df["bytes"] = df.get("bytes", 0).apply(_safe_float)
-        df["packets"] = df.get("packets", 0).apply(_safe_float)
-        # Flow duration if available as start/end; else estimate from packets
+        df["packets"] = df.get("packets", 0).apply(_safe_float).clip(lower=1)
+
+        # Flow duration: softened heuristic if no explicit start/end
         if "flow_start" in df.columns and "flow_end" in df.columns:
             df["flow_start"] = _ensure_datetime(df["flow_start"]) 
             df["flow_end"] = _ensure_datetime(df["flow_end"]) 
             df["flow_duration_ms"] = (df["flow_end"] - df["flow_start"]).dt.total_seconds() * 1000
         else:
-            # heuristic: assume 1 ms per packet if not provided
-            df["flow_duration_ms"] = df["packets"].clip(lower=1)
-        # Rates
-        duration_s = (df["flow_duration_ms"].replace(0, 1) / 1000.0)
-        df["pps"] = df["packets"] / duration_s
-        df["bps"] = (df["bytes"] * 8) / duration_s
+            # 10 ms per packet, but not lower than 50 ms per flow
+            df["flow_duration_ms"] = (df["packets"] * 10.0).clip(lower=50.0)
 
-        # Normalize categorical columns into integers
+        duration_s = (df["flow_duration_ms"].clip(lower=1.0) / 1000.0)
+        df["pps"] = df["packets"] / duration_s
+        df["bps"] = (df["bytes"] * 8.0) / duration_s
+
+        # Log-stabilized features
+        df["bytes_log"] = np.log1p(df["bytes"])
+        df["packets_log"] = np.log1p(df["packets"])
+        df["pps_log"] = np.log1p(df["pps"])
+        df["bps_log"] = np.log1p(df["bps"])
+
+        # Port bins
         for col in ["src_port", "dst_port"]:
             if col not in df:
                 df[col] = 0
-            df[col] = df[col].fillna(0).astype(float)
+        df["src_port_bin"] = df["src_port"].apply(_port_bin)
+        df["dst_port_bin"] = df["dst_port"].apply(_port_bin)
 
-        # device_id present? if not, fill constant
+        # Device ID fallback
         if "device_id" not in df:
             df["device_id"] = "unknown"
 
-        # Reorder/select
         cols = list(dict.fromkeys(self.cfg.numeric_cols))
         X = df[cols].fillna(0.0)
         return X
 
 
 # -----------------------------
-# Model Manager
+# Model Manager (with calibration)
 # -----------------------------
 class ModelManager:
     def __init__(self, feature_extractor: FeatureExtractor, train_cfg: TrainConfig):
@@ -143,10 +164,14 @@ class ModelManager:
         self.train_cfg = train_cfg
         self.scaler = StandardScaler()
         self.model = None  # type: ignore
+        # Calibration for IsolationForest → stable single-record scores
+        self.if_shift: Optional[float] = None
+        self.if_scale: Optional[float] = None
 
     def fit(self, df: pd.DataFrame) -> None:
         X = self.fx.transform_frame(df)
         X_scaled = self.scaler.fit_transform(X)
+
         if self.train_cfg.algo == "isolation_forest":
             self.model = IsolationForest(
                 n_estimators=self.train_cfg.n_estimators,
@@ -156,6 +181,14 @@ class ModelManager:
                 n_jobs=-1,
             )
             self.model.fit(X_scaled)
+
+            # Calibration using train-set percentiles (5th/95th)
+            train_scores = -self.model.score_samples(X_scaled)
+            self.if_shift = float(np.percentile(train_scores, 1))
+            self.if_scale = float(np.percentile(train_scores, 99) - self.if_shift)
+            if self.if_scale <= 1e-8:
+                self.if_scale = 1.0
+
         elif self.train_cfg.algo == "autoencoder":
             if not TENSORFLOW_AVAILABLE:
                 raise RuntimeError("TensorFlow is not available for autoencoder option.")
@@ -166,30 +199,39 @@ class ModelManager:
     def score_anomaly(self, df: pd.DataFrame) -> np.ndarray:
         X = self.fx.transform_frame(df)
         X_scaled = self.scaler.transform(X)
+
         if isinstance(self.model, IsolationForest):
-            # IsolationForest: higher negative score => more anomalous.
             raw = -self.model.score_samples(X_scaled)
-            # Normalize to [0,1] using min-max over recent batch
-            min_v, max_v = float(np.min(raw)), float(np.max(raw))
-            denom = (max_v - min_v) if max_v > min_v else 1.0
-            return (raw - min_v) / denom
+            if self.if_shift is not None and self.if_scale is not None:
+                scores = (raw - self.if_shift) / self.if_scale
+                return np.clip(scores, 0, 1)
+            # Fallback for legacy bundles
+            p95 = np.percentile(raw, 95)
+            return np.clip(raw / (p95 + 1e-8), 0, 1)
         else:
-            # Autoencoder: reconstruction error as anomaly score
+            # Autoencoder: reconstruction error
             preds = self.model.predict(X_scaled, verbose=0)
             mse = np.mean(np.square(X_scaled - preds), axis=1)
-            # Robust scaling
             p95 = np.percentile(mse, 95)
             return np.clip(mse / (p95 + 1e-8), 0, 1)
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        dump({"scaler": self.scaler, "model": self.model, "train_cfg": self.train_cfg}, path)
+        dump({
+            "scaler": self.scaler,
+            "model": self.model,
+            "train_cfg": self.train_cfg,
+            "if_shift": self.if_shift,
+            "if_scale": self.if_scale,
+        }, path)
 
     def load(self, path: str) -> None:
         bundle = load(path)
         self.scaler = bundle["scaler"]
         self.model = bundle["model"]
         self.train_cfg = bundle.get("train_cfg", self.train_cfg)
+        self.if_shift = bundle.get("if_shift", None)
+        self.if_scale = bundle.get("if_scale", None)
 
     # --- Autoencoder training ---
     def _fit_autoencoder(self, X: np.ndarray):
@@ -213,7 +255,6 @@ class AlertSink:
     def __init__(self):
         pass
     def send(self, record: Dict[str, Any], score: float, threshold: float) -> None:
-        # In production, integrate SIEM/webhook/email/etc.
         print(json.dumps({"event": "anomaly", "score": score, "threshold": threshold, "record": record}, ensure_ascii=False))
 
 
@@ -237,9 +278,7 @@ class RealtimeDetector:
 
 def load_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # normalize column names
     df.columns = [c.strip().lower() for c in df.columns]
-    # expected: timestamp, device_id, src_ip, dst_ip, src_port, dst_port, protocol, bytes, packets
     return df
 
 
@@ -257,7 +296,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         max_samples=args.max_samples,
         random_state=args.random_state,
     ))
-    # For one-class training, if a label column is provided, keep only normal samples
     if args.label_col and args.normal_label is not None and args.label_col in df.columns:
         normal_df = df[df[args.label_col] == args.normal_label]
         if len(normal_df) < 100:
@@ -276,21 +314,18 @@ def cmd_eval(args: argparse.Namespace) -> None:
     mgr = ModelManager(fx, TrainConfig())
     mgr.load(args.model)
     scores = mgr.score_anomaly(df)
-    y_true = None
     if args.label_col and args.label_col in df.columns and args.positive_label is not None:
         y_true = (df[args.label_col] == args.positive_label).astype(int).values
-        # simple thresholding
         y_pred = (scores >= args.threshold).astype(int)
         prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-        print(json.dumps({"precision": prec, "recall": rec, "f1": f1}, indent=2))
+        print(json.dumps({"precision": float(prec), "recall": float(rec), "f1": float(f1)}, indent=2))
         try:
             auc = roc_auc_score(y_true, scores)
-            print(json.dumps({"roc_auc": auc}, indent=2))
+            print(json.dumps({"roc_auc": float(auc)}, indent=2))
         except Exception:
             pass
     else:
         print("[INFO] No labels provided; outputting scores only.")
-    # Save scores
     out = df.copy()
     out["anomaly_score"] = scores
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -320,7 +355,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             score = rtd.score_record(payload)
             return jsonify({"score": score, "threshold": rtd.thr.threshold, "anomaly": score >= rtd.thr.threshold})
         elif isinstance(payload, list):
-            scores = [rtd.score_record(p) for p in payload]
+            scores = [float(rtd.score_record(p)) for p in payload]
             return jsonify({"scores": scores, "threshold": rtd.thr.threshold})
         else:
             return jsonify({"error": "Invalid payload"}), 400
@@ -375,8 +410,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sp.add_argument("--input", required=True)
     sp.add_argument("--model", required=True)
     sp.add_argument("--algo", default="isolation_forest", choices=["isolation_forest", "autoencoder"])
-    sp.add_argument("--n-estimators", type=int, default=200)
-    sp.add_argument("--contamination", type=float, default=0.01)
+    sp.add_argument("--n-estimators", type=int, default=300)
+    sp.add_argument("--contamination", type=float, default=0.02)
     sp.add_argument("--max-samples", default="auto")
     sp.add_argument("--random-state", type=int, default=42)
     sp.add_argument("--label-col", default=None)
@@ -426,3 +461,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

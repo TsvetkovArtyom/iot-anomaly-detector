@@ -1,0 +1,2 @@
+timestamp,device_id,src_ip,dst_ip,src_port,dst_port,protocol,bytes,packets,label
+2025-11-05T12:12:00,sensor-05,192.168.1.7,192.168.1.100,5683,5683,CoAP,1200,15,normal
